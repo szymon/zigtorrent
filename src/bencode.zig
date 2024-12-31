@@ -4,8 +4,12 @@ const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
+const BitStack = std.BitStack;
 
 const default_max_len = 4 * 1024 * 1024;
+
+const OBJECT_MODE = 0;
+const LIST_MODE = 1;
 
 pub fn WriteStream(comptime OutStream: type) type {
     return struct {
@@ -126,20 +130,18 @@ pub const Token = union(enum) {
     end_of_document,
 };
 
-
 ///
-/// i123e: 
+/// i123e: value -> int -> value
+/// 3:ala: value -> string_len -> string -> value
+/// l{}e: value -> value (state==[list]) -> end_nested -> value
+/// d{}e: value -> value (state==[object]) -> end_nested -> value
 pub const TokenType = enum {
+    number,
+    string,
     object_begin,
     object_end,
     array_begin,
     array_end,
-    value_end,
-    true,
-    false,
-    null,
-    number,
-    string,
     end_of_document,
 };
 
@@ -147,210 +149,175 @@ pub const AllocWhen = enum { alloc_if_needed, alloc_always };
 
 pub const Scanner = struct {
     const Self = @This();
-    pub const NextError = Error || Allocator.Error || std.fmt.ParseIntError || error{BufferUnderrun};
-    pub const AllocError = Error || Allocator.Error || error{ValueToLarge};
-    pub const PeekError = Error || error{BufferUnderrun};
-    pub const SkipError = Error || Allocator.Error;
-    pub const AllocIntoArrayListError = AllocError || error{BufferUnderrun};
 
+    stack: BitStack,
     input: []const u8 = "",
     cursor: usize = 0,
-    value_start: usize = 0,
-    is_end_of_input: bool = false,
-    string_len: usize = 0,
-    expect_closing_tag: bool = false,
     state: enum {
         value,
-        post_value,
-
-        number_start,
-        string_start,
-        string_value,
-        value_end,
+        number,
+        string,
+        end_nested,
     } = .value,
 
     pub fn deinit(self: *Self) void {
-        _ = self;
+        self.stack.deinit();
+        self.* = undefined;
     }
 
     pub fn initCompleteInput(allocator: Allocator, complete_input: []const u8) Self {
-        _ = allocator;
         return .{
             .input = complete_input,
+            .stack = BitStack.init(allocator),
         };
     }
 
-    pub fn peekNextTokenType(self: *Self) PeekError!TokenType {
-        std.debug.print("peek {}: {} {s}\n", .{ self.state, self.cursor, self.input[self.cursor..] });
-        state_loop: while (true) {
-            switch (self.state) {
-                .value => {
-                    switch (try self.peek()) {
-                        'i' => return .number,
-                        '0'...'9' => return .string,
-                        'l' => return .array_begin,
-                        'd' => return .object_begin,
-                        'e' => return .value_end,
-                        else => return error.SyntaxError,
-                    }
-                },
-                .post_value => {
-                    if (self.expect_closing_tag) {
-                        self.expect_closing_tag = false;
-                        const c = try self.peek();
-                        if (c == 'e') {
-                            self.cursor += 1;
-                        } else {
-                            return error.SyntaxError;
-                        }
-                    }
-
-                    if (self.cursor < self.input.len) {
-                        self.state = .value;
-                        continue :state_loop;
-                    } else {
-                        return .end_of_document;
-                    }
-                },
-                else => @panic("unimplemented"),
-            }
-            unreachable;
+    fn peek(self: Self) ParseFromValueError!u8 {
+        if (self.cursor < self.input.len) {
+            return self.input[self.cursor];
+        } else {
+            return ParseFromValueError.UnexpectedEndOfInput;
         }
     }
 
-    pub fn next(self: *Self) NextError!Token {
+    pub fn peekNextTokenType(self: Self) ParseFromValueError!TokenType {
+        switch (try self.peek()) {
+            'i' => {
+                return .number;
+            },
+            '0'...'9' => {
+                return .string;
+            },
+            'l' => {
+                return .array_begin;
+            },
+            'd' => {
+                return .object_begin;
+            },
+            'e' => {
+                if (self.stack.bit_len == 0) {
+                    return ParseFromValueError.UnexpectedEndOfInput;
+                }
+                switch (self.stack.peek()) {
+                    OBJECT_MODE => {
+                        return .object_end;
+                    },
+                    LIST_MODE => {
+                        return .array_end;
+                    },
+                }
+            },
+            else => {
+                @panic("guwno");
+            },
+        }
+    }
+
+    pub fn next(self: *Self) ParseFromValueError!Token {
         state_loop: while (true) {
-            std.debug.print("loop {}: {} {s}\n", .{ self.state, self.cursor, self.input[self.cursor..] });
+            std.debug.print("state={}, cursor={} input={s}\n", .{ self.state, self.cursor, self.input[self.cursor..] });
+            if (self.cursor == self.input.len) {
+                if (self.state == .value) {
+                    return .end_of_document;
+                } else {
+                    return ParseFromValueError.UnexpectedEndOfInput;
+                }
+            }
             switch (self.state) {
                 .value => {
                     switch (try self.peek()) {
                         'i' => {
                             self.cursor += 1;
-                            self.value_start = self.cursor;
-                            self.state = .number_start;
-                            self.expect_closing_tag = true;
+                            self.state = .number;
                             continue :state_loop;
                         },
                         '0'...'9' => {
-                            self.value_start = self.cursor;
-                            self.state = .string_start;
+                            self.state = .string;
                             continue :state_loop;
+                        },
+                        'd' => {
+                            self.cursor += 1;
+                            try self.stack.push(OBJECT_MODE);
+                            return .object_begin;
                         },
                         'l' => {
                             self.cursor += 1;
-                            self.state = .value;
+                            try self.stack.push(LIST_MODE);
                             return .array_begin;
                         },
                         'e' => {
-                            self.state = .value_end;
-                            continue :state_loop;
+                            self.cursor += 1;
+                            if (self.stack.bit_len == 0) {
+                                return ParseFromValueError.UnexpectedToken;
+                            }
+                            switch (self.stack.pop()) {
+                                LIST_MODE => {
+                                    return .array_end;
+                                },
+                                OBJECT_MODE => {
+                                    return .object_end;
+                                },
+                            }
                         },
-                        else => @panic("unimplemented"),
+                        else => {
+                            @panic("xd");
+                        },
                     }
                 },
-                .number_start => {
-                    while (self.cursor < self.input.len) : (self.cursor += 1) {
-                        switch (self.input[self.cursor]) {
-                            '-' => continue,
-                            '0'...'9' => continue,
-                            else => {
-                                self.state = .post_value;
-                                return Token{ .number = self.takeValueSlice() };
-                            },
-                        }
-                    }
-                },
-                .string_start => {
-                    while (self.cursor < self.input.len) : (self.cursor += 1) {
-                        switch (self.input[self.cursor]) {
-                            '0'...'9' => continue,
-                            ':' => {
-                                const slice = self.takeValueSlice();
-                                std.debug.print("parsing len from slice: {s}\n", .{slice});
-                                const len = try std.fmt.parseInt(usize, slice, 10);
-                                self.state = .string_value;
-                                self.value_start = self.cursor + 1;
-                                self.cursor += 1 + len;
-                                continue :state_loop;
-                            },
-                            else => return error.SyntaxError,
-                        }
-                    }
-                },
-                .string_value => {
-                    if (self.cursor < self.input.len) return error.BufferUnderrun;
-                    const slice = self.input[self.value_start..self.cursor];
-                    self.state = .post_value;
-                    self.expect_closing_tag = false;
-                    return Token{ .string = slice };
-                },
-                .post_value => {
-                    if (self.expect_closing_tag) {
-                        self.expect_closing_tag = false;
+                .number => {
+                    const value_start = self.cursor;
+                    while (true) {
                         const c = try self.peek();
-                        if (c == 'e') {
+                        if (c != 'e') {
                             self.cursor += 1;
                         } else {
-                            return error.SyntaxError;
+                            break;
                         }
                     }
 
-                    if (self.cursor < self.input.len) {
-                        self.state = .value;
-                        continue :state_loop;
-                    } else {
-                        return .end_of_document;
-                    }
+                    self.cursor += 1;
+                    self.state = .value;
+
+                    return Token{ .number = self.input[value_start .. self.cursor - 1] };
                 },
-                .value_end => {
-                    if (self.expect_closing_tag) {
-                        self.expect_closing_tag = false;
+                .string => {
+                    const value_start = self.cursor;
+                    while (true) {
                         const c = try self.peek();
-                        if (c == 'e') {
+                        if (c != ':') {
                             self.cursor += 1;
                         } else {
-                            return error.SyntaxError;
+                            break;
                         }
                     }
+
+                    const len = try std.fmt.parseInt(usize, self.input[value_start..self.cursor], 10);
+                    self.cursor += 1;
+
+                    if (self.cursor + len > self.input.len) {
+                        return ParseFromValueError.UnexpectedEndOfInput;
+                    }
+
+                    const string_start = self.cursor;
+                    self.cursor += len;
+                    self.state = .value;
+
+                    return Token{ .string = self.input[string_start..self.cursor] };
+                },
+                else => {
+                    @panic("unreachable");
                 },
             }
         }
-
-        return .end_of_document;
-    }
-
-    fn takeValueSlice(self: *Self) []const u8 {
-        const slice = self.input[self.value_start..self.cursor];
-        self.value_start = self.cursor;
-        return slice;
-    }
-
-    fn peek(self: *const Self) !u8 {
-        if (self.cursor < self.input.len) {
-            return self.input[self.cursor];
-        }
-
-        if (self.is_end_of_input) return error.UnexpectedEndOfInput;
-        return error.BufferUnderrun;
     }
 };
 
 pub const ParseFromValueError = std.fmt.ParseIntError || std.fmt.ParseFloatError || Allocator.Error || error{
     UnexpectedToken,
-    InvalidNumber,
-    Overflow,
-    InvalidEnumTag,
-    DuplicateField,
-    UnknownField,
-    MissingField,
-    LengthMismatch,
+    UnexpectedEndOfInput,
 };
 
-pub fn ParseError(comptime Source: type) type {
-    return ParseFromValueError || Source.NextError || Source.PeekError || Source.AllocError;
-}
-
-pub fn parseFromTokenSourceLeaky(comptime T: type, allocator: Allocator, scanner_or_reader: *Scanner) ParseError(Scanner)!T {
+pub fn parseFromTokenSourceLeaky(comptime T: type, allocator: Allocator, scanner_or_reader: *Scanner) ParseFromValueError!T {
     const value = try innerParse(T, allocator, scanner_or_reader);
 
     assert(.end_of_document == try scanner_or_reader.next());
@@ -358,7 +325,8 @@ pub fn parseFromTokenSourceLeaky(comptime T: type, allocator: Allocator, scanner
     return value;
 }
 
-fn innerParse(comptime T: type, allocator: Allocator, source: *Scanner) ParseError(Scanner)!T {
+fn innerParse(comptime T: type, allocator: Allocator, source: *Scanner) ParseFromValueError!T {
+    std.debug.print("trying to parse: {s}\n", .{@typeName(T)});
     switch (@typeInfo(T)) {
         .Int, .ComptimeInt => {
             const token = try source.next();
@@ -367,30 +335,6 @@ fn innerParse(comptime T: type, allocator: Allocator, source: *Scanner) ParseErr
                 else => return error.UnexpectedToken,
             };
             return std.fmt.parseInt(T, slice, 10);
-        },
-        .Array => |array_info| {
-            switch (try source.next()) {
-                .string => |slice| {
-                    if (array_info.child != u8) return error.UnexpectedToken;
-
-                    const r: T = undefined;
-
-                    if (slice.len != r.len) return error.LengthMismatch;
-                    @memcpy(r, slice);
-                    return r;
-                },
-                .array_begin => {
-                    var r: T = undefined;
-                    var i: usize = 0;
-                    while (i < array_info.len) : (i += 1) {
-                        r[i] = try innerParse(array_info.child, allocator, source);
-                    }
-
-                    if (.array_end != try source.next()) return error.UnexpectedToken;
-                    return r;
-                },
-                else => @panic("unreachable"),
-            }
         },
         .Pointer => |ptr_info| {
             switch (ptr_info.size) {
@@ -410,16 +354,20 @@ fn innerParse(comptime T: type, allocator: Allocator, source: *Scanner) ParseErr
                         .array_begin => {
                             var arraylist = ArrayList(ptr_info.child).init(allocator);
                             while (true) {
-                                switch (try source.peekNextTokenType()) {
+                                const tt = try source.peekNextTokenType();
+                                std.debug.print("getting next token for array: {}\n", .{tt});
+                                switch (tt) {
                                     .array_end => {
                                         _ = try source.next();
+                                        std.debug.print("got end of array\n", .{});
                                         break;
                                     },
                                     else => {},
                                 }
 
-                                try arraylist.ensureUnusedCapacity(1);
-                                arraylist.appendAssumeCapacity(try innerParse(ptr_info.child, allocator, source));
+                                const val = try innerParse(ptr_info.child, allocator, source);
+                                std.debug.print("appending value: {}\n", .{val});
+                                try arraylist.append(val);
                             }
 
                             if (ptr_info.sentinel) |_| {
@@ -439,7 +387,7 @@ fn innerParse(comptime T: type, allocator: Allocator, source: *Scanner) ParseErr
     unreachable;
 }
 
-pub fn parseFromSliceLeaky(comptime T: type, allocator: Allocator, s: []const u8) ParseError(Scanner)!T {
+pub fn parseFromSliceLeaky(comptime T: type, allocator: Allocator, s: []const u8) ParseFromValueError!T {
     var scanner = Scanner.initCompleteInput(allocator, s);
     defer scanner.deinit();
 
@@ -491,17 +439,11 @@ test "encode struct" {
     try stringify(.{ .ala = 123 }, out.writer());
     try testing.expectEqualSlices(u8, "d3:alai123ee", out.items);
 }
-
 test "decode trivial" {
     try testing.expectEqual(123, try parseFromSliceLeaky(i32, testing.allocator, "i123e"));
     try testing.expectEqual(-123, try parseFromSliceLeaky(i32, testing.allocator, "i-123e"));
     try testing.expectEqualSlices(u8, "ala", try parseFromSliceLeaky([]const u8, testing.allocator, "3:ala"));
-    try testing.expectEqualSlices(i32, &[3]i32{ 1, 2, 3 }, try parseFromSliceLeaky([]i32, testing.allocator, "li1ei2ei3ee"));
-
-    // const t = struct {
-    //     a: i32,
-    // };
-
-    // const result = try parseFromSliceLeaky(@TypeOf(t), testing.allocator, "d1:ai123ee");
-    // try testing.expectEqual(123, result.a);
+    const list_result = try parseFromSliceLeaky([]i32, testing.allocator, "li1ei2ei3ee");
+    try testing.expectEqualSlices(i32, &[3]i32{ 1, 2, 3 }, list_result);
+    defer testing.allocator.free(list_result);
 }
