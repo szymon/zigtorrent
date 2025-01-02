@@ -1,26 +1,89 @@
 const std = @import("std");
 
-const bencode = @import("./bencode.zig");
+const Allocator = std.mem.Allocator;
+
+const bencode = @import("bencode.zig");
+const tracker = @import("tracker.zig");
+const utils = @import("utils.zig");
+
+const Torrent = @import("torrent.zig").Torrent;
+
+fn loadTorrent(allocator: Allocator, path: []const u8) anyerror!Torrent {
+    var file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    var buf_reader = std.io.bufferedReader(file.reader());
+    var in_reader = buf_reader.reader();
+
+    const data = try in_reader.readAllAlloc(allocator, 4 * 1024 * 1024);
+
+    return try bencode.parseFromSliceLeaky(Torrent, allocator, data, .{ .debug = true });
+}
 
 pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
     const stdout_file = std.io.getStdOut().writer();
     var bw = std.io.bufferedWriter(stdout_file);
     const stdout = bw.writer();
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+    const args = std.os.argv;
 
-    try bw.flush(); // don't forget to flush!
-}
+    if (args.len < 2) {
+        try stdout.print("USAGE: {s} file\n", .{args[0]});
+        try bw.flush();
+        return;
+    }
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+    const path_to_torrent = args[1];
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const deinit_status = gpa.deinit();
+        //fail test; can't try in defer as defer is executed after we return
+        if (deinit_status == .leak) std.testing.expect(false) catch @panic("TEST FAIL");
+    }
+
+    const alloc = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arenaAlloc = arena.allocator();
+
+    const torrent = try loadTorrent(arenaAlloc, std.mem.span(path_to_torrent));
+    try torrent.displayInfo(arenaAlloc, stdout);
+    try stdout.print("peer id: {s}\n", .{utils.peerId()});
+
+    try bw.flush();
+
+    {
+        switch (try tracker.getTrackerResponse(arenaAlloc, torrent)) {
+            .success => |response| {
+                try stdout.print(
+                    \\TrackerResponse:
+                    \\  interval: {}
+                    \\  tracker id: {s}
+                    \\  complete: {}
+                    \\  incomplete: {}
+                    \\  peers:
+                    \\
+                , .{
+                    response.interval,
+                    response.@"tracker id",
+                    response.complete,
+                    response.incomplete,
+                });
+
+                for (response.peers) |peer| {
+                    try stdout.print("{{ id: {s}, ip: {s}, port: {} }}", .{
+                        peer.@"peer id",
+                        peer.ip,
+                        peer.port,
+                    });
+                }
+            },
+            .err => |err| {
+                try stdout.print("TrackerResponse\n  failure reason: {s}\n", .{err.@"failure reason"});
+            },
+        }
+    }
+
+    try bw.flush();
 }

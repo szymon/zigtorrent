@@ -15,6 +15,12 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+
+    const zeit = b.dependency("zeit", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const lib = b.addStaticLibrary(.{
         .name = "zigtorrent",
         // In this case the main source file is merely a path, however, in more
@@ -40,6 +46,8 @@ pub fn build(b: *std.Build) void {
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).
     b.installArtifact(exe);
+
+    exe.root_module.addImport("zeit", zeit.module("zeit"));
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
@@ -79,6 +87,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    exe_unit_tests.root_module.addImport("zeit", zeit.module("zeit"));
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
